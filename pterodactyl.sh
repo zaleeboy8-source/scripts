@@ -1,81 +1,84 @@
 #!/usr/bin/env bash
-# pterodactyl.sh — Interactive installer (Panel, Wings, Theme, SSL)
-# Target: Debian 12+ (Bookworm). Tested concepts: Nginx, PHP 8.3 (SURY), MariaDB, Redis, Certbot (snap)
+# ============================================================
+# pterodactyl.sh — ZaleeHost Interactive Pterodactyl Installer
+# Supports: Debian 12 (Bookworm) and Ubuntu 22.04/24.04
+# Features: Panel, Wings, Theme (ZaleeDark), Let's Encrypt SSL, Self-signed fallback
 # Author: ZaleeHost (prepared for zaleeboy)
+# Log: /root/ptero_install.log
+# ============================================================
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 LOGFILE="/root/ptero_install.log"
+exec > >(tee -a "$LOGFILE") 2>&1
 
-# ---------- Colors ----------
-GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; BLUE="\e[34m"; MAGENTA="\e[35m"
+# ----------------- Colors & helpers -----------------
+GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; CYAN="\e[36m"; BLUE="\e[34m"
 BOLD="\e[1m"; RESET="\e[0m"
 
-info(){ echo -e "${BOLD}${BLUE}==>${RESET} $1"; }
-ok(){ echo -e "${GREEN}✔ $1${RESET}"; }
-warn(){ echo -e "${YELLOW}⚠ $1${RESET}"; }
-err(){ echo -e "${RED}✘ $1${RESET}"; exit 1; }
+info(){ printf "${BOLD}${CYAN}==>${RESET} %s\n" "$1"; }
+ok(){ printf "${GREEN}✔ %s${RESET}\n" "$1"; }
+warn(){ printf "${YELLOW}⚠ %s${RESET}\n" "$1"; }
+fail(){ printf "${RED}✘ %s${RESET}\n" "$1"; exit 1; }
 
-# ---------- Helpers ----------
-spinner_start(){
-  # start spinner for background PID: spinner_start <pid>
-  pid="$1"
-  (
-    spin='/-\|'
-    i=0
-    while kill -0 "$pid" 2>/dev/null; do
-      printf "\r [%c] " "${spin:i%4:1}"
-      sleep 0.08
-      ((i++))
-    done
-    printf "\r"
-  ) &
-  SPINNER_PID=$!
+require_root(){
+  if [ "$EUID" -ne 0 ]; then
+    fail "Please run this script with sudo or as root."
+  fi
 }
-spinner_stop(){
-  # stop spinner
-  kill "$SPINNER_PID" 2>/dev/null || true
-  wait "$SPINNER_PID" 2>/dev/null || true
+
+spinner() {
+  # spinner <pid>
+  local pid=$1; local delay=0.08; local spinstr='|/-\'
+  while ps -p "$pid" >/dev/null 2>&1; do
+    for i in 0 1 2 3; do
+      printf "\r ${BLUE}[%c]${RESET}" "${spinstr:i:1}"
+      sleep $delay
+    done
+  done
   printf "\r"
 }
 
-check_root(){
-  if [ "$EUID" -ne 0 ]; then
-    err "Please run this script as root (sudo)."
-  fi
-}
-
-confirm_prompt(){
-  # confirm_prompt "Question" default_yes_flag
-  local prompt="$1"; local default_yes="${2:-1}"
+confirm(){
+  # confirm "Question" default_yes(1/0)
+  local prompt="$1"
+  local default_yes="${2:-1}"
   local ans
   if [ "$default_yes" -eq 1 ]; then
-    read -rp "$prompt [Y/n]: " ans
-    ans=${ans:-Y}
+    read -rp "$prompt [Y/n]: " ans; ans=${ans:-Y}
   else
-    read -rp "$prompt [y/N]: " ans
-    ans=${ans:-N}
+    read -rp "$prompt [y/N]: " ans; ans=${ans:-N}
   fi
   case "${ans,,}" in
-    y|yes) return 0 ;;
-    *) return 1 ;;
+    y|yes) return 0;;
+    *) return 1;;
   esac
 }
 
 read_input(){
-  # read_input "prompt" "default"
-  local prompt="$1"
-  local default="${2:-}"
-  if [ -n "$default" ]; then
-    read -rp "$prompt [$default]: " val
-    val=${val:-$default}
+  # read_input "Prompt" "default"
+  local prompt="$1"; local def="${2:-}"
+  if [ -n "$def" ]; then
+    read -rp "$prompt [$def]: " val
+    val=${val:-$def}
   else
     read -rp "$prompt: " val
   fi
   echo "$val"
 }
 
-# ---------- Banner ----------
-clear
+detect_distro(){
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO_ID="${ID,,}"
+    DISTRO_NAME="${NAME}"
+    DISTRO_VER="${VERSION_ID}"
+  else
+    fail "Unsupported OS — cannot detect distribution."
+  fi
+}
+
+banner(){
 cat <<'EOF'
 ██████╗ ███████╗████████╗ █████╗ ██████╗  ██████╗  ██████╗██╗  ██╗
 ██╔══██╗██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝
@@ -83,57 +86,54 @@ cat <<'EOF'
 ██╔═══╝ ██╔══╝     ██║   ██╔══██║██╔═══╝ ██║   ██║██║     ██╔═██╗ 
 ██║     ███████╗   ██║   ██║  ██║██║     ╚██████╔╝╚██████╗██║  ██╗
 ╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝      ╚═════╝  ╚═════╝╚═╝  ╚═╝
-      ZaleeHost — Pterodactyl Interactive Installer
+      ZaleeHost — Pterodactyl Interactive Installer (Fancy)
 EOF
-echo
-echo "Log will be saved to: $LOGFILE"
-echo
+}
 
-check_root
+# ----------------- Defaults (can be overridden interactively) -----------------
+THEME_REPO_DEFAULT="https://github.com/zaleeboy8-source/zaleedark-theme.git"
+PANEL_DIR_DEFAULT="/var/www/pterodactyl"
 
-# ---------- Interactive choices ----------
-echo "Choose what to install (you can run multiple times):"
+# ----------------- Pre-checks -----------------
+require_root
+detect_distro
+banner
+printf "%s %s %s\n\n" "Detected OS:" "$DISTRO_NAME" "$DISTRO_VER"
+
+# ----------------- Interactive menu -----------------
+echo "Choose action (enter the number):"
 echo "  1) Install Panel (frontend)"
 echo "  2) Install Wings (node)"
 echo "  3) Apply Theme (ZaleeDark)"
 echo "  4) Full Install (Panel + Wings + Theme)"
 echo "  0) Exit"
-read -rp "Select option [1-4,0]: " CHOICE
+read -rp "Select [1-4,0]: " CHOICE
 CHOICE=${CHOICE:-4}
 
-# Collect common info (allow manual edits)
-DEFAULT_DOMAIN="panel.tesdomain2105.dpdns.org"
-DOMAIN=$(read_input "Enter domain for panel (must point to this server)" "$DEFAULT_DOMAIN")
-ADMIN_EMAIL=$(read_input "Enter admin email (for Let's Encrypt & admin user)" "zaleeboy8@gmail.com")
-PANEL_DIR_DEFAULT="/var/www/pterodactyl"
-PANEL_DIR=$(read_input "Panel directory" "$PANEL_DIR_DEFAULT")
-
-# SSL choice
-if confirm_prompt "Use Let's Encrypt (recommended) for SSL?" 1; then
-  SSL_CHOICE="letsencrypt"
-else
-  SSL_CHOICE="manual"
+# Collect manual inputs
+DOMAIN=$(read_input "Enter panel domain (must point to this server)" "$PANEL_DIR_DEFAULT" | sed 's|/$||')
+# The above line had bug earlier: ensure DOMAIN default corrected:
+if [ "$DOMAIN" = "$PANEL_DIR_DEFAULT" ]; then
+  DOMAIN=$(read_input "Enter panel domain (must point to this server)" "panel.tesdomain2105.dpdns.org")
 fi
 
-# MariaDB choice
-if confirm_prompt "Install local MariaDB on this server?" 1; then
-  DB_INSTALL="yes"
-  # ask manual DB credentials or auto
-  if confirm_prompt "Create DB user/password automatically?" 1; then
-    DB_AUTOGEN=1
+ADMIN_EMAIL=$(read_input "Enter admin email (used for Let's Encrypt & admin user)" "zaleeboy8@gmail.com")
+PANEL_DIR=$(read_input "Panel directory" "$PANEL_DIR_DEFAULT")
+THEME_REPO=$(read_input "Theme repository URL" "$THEME_REPO_DEFAULT")
+
+if confirm "Install local MariaDB server and create database/user?" 1; then
+  DB_WANT="yes"
+  if confirm "Auto-generate DB password?" 1; then
     DB_PASS="$(openssl rand -base64 16)"
   else
-    DB_AUTOGEN=0
-    DB_PASS=$(read_input "Enter desired DB password" "")
+    DB_PASS=$(read_input "Enter DB password" "")
   fi
 else
-  DB_INSTALL="no"
-  DB_AUTOGEN=0
+  DB_WANT="no"
   DB_PASS=""
 fi
 
-# Admin account options
-if confirm_prompt "Create admin user automatically? (email & password will be shown in summary)" 1; then
+if confirm "Create admin user automatically after install?" 1; then
   CREATE_ADMIN=1
   ADMIN_USER=$(read_input "Admin username" "ZaleeHost")
   ADMIN_PASS=$(read_input "Admin password" "zalee1")
@@ -143,104 +143,110 @@ else
   ADMIN_PASS=""
 fi
 
-# Theme repo (allow change)
-THEME_REPO_DEFAULT="https://github.com/zaleeboy8-source/zaleedark-theme.git"
-THEME_REPO=$(read_input "Theme repo URL (ZaleeDark default)" "$THEME_REPO_DEFAULT")
-
-echo
-echo "Summary of choices:"
-echo "  Install option : $CHOICE"
-echo "  Domain         : $DOMAIN"
-echo "  Admin email    : $ADMIN_EMAIL"
-echo "  SSL method     : $SSL_CHOICE"
-echo "  MariaDB install: $DB_INSTALL"
-[ "$DB_INSTALL" = "yes" ] && echo "  DB password    : ${DB_PASS:0:8}...(hidden)"
-echo "  Panel dir      : $PANEL_DIR"
-echo "  Theme repo     : $THEME_REPO"
-echo
-if ! confirm_prompt "Continue with these settings?" 1; then
-  err "Aborting by user"
+if confirm "Use Let's Encrypt for SSL (recommended)? " 1; then
+  SSL_METHOD="letsencrypt"
+else
+  SSL_METHOD="selfsigned"
 fi
 
-# Start logging
-exec > >(tee -a "$LOGFILE") 2>&1
+echo
+info "Summary — please confirm:"
+echo "  Action: $(case $CHOICE in 1) echo Panel ;; 2) echo Wings ;; 3) echo Theme ;; 4) echo Full ;; *) echo Exit ;; esac)"
+echo "  Domain: $DOMAIN"
+echo "  Admin: $ADMIN_EMAIL"
+echo "  Panel dir: $PANEL_DIR"
+echo "  Theme repo: $THEME_REPO"
+echo "  MariaDB install: $DB_WANT"
+echo "  SSL method: $SSL_METHOD"
+if [ "$DB_WANT" = "yes" ]; then
+  echo "  DB password: ${DB_PASS:0:8}...(hidden)"
+fi
+if ! confirm "Continue with these settings?" 1; then
+  fail "Aborted by user."
+fi
 
-# ---------- Functions for tasks ----------
-install_basic_packages(){
-  info "Updating system and installing basic packages..."
-  apt update -y
-  apt upgrade -y
-  apt install -y nginx redis-server unzip git curl tar ufw ca-certificates lsb-release gnupg build-essential
-  ok "Basic packages installed"
+# ----------------- Core helper functions -----------------
+apt_quiet_install(){
+  DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends "$@" >/dev/null 2>&1
 }
 
-add_sury_php(){
-  info "Adding SURY repo (PHP 8.3)..."
-  apt install -y apt-transport-https lsb-release ca-certificates curl gnupg
+add_sury_php_repo(){
+  info "Adding Sury PHP repo for PHP 8.3 (if needed)..."
+  apt_quiet_install apt-transport-https ca-certificates lsb-release gnupg curl
   curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/sury.gpg
   echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/sury-php.list
+  apt update -y >/dev/null 2>&1
+  ok "Sury repo added"
+}
+
+install_common_packages(){
+  info "Updating system and installing common packages..."
   apt update -y
-  ok "SURY repo ready"
+  apt upgrade -y
+  apt_quiet_install nginx redis-server unzip git curl tar ufw ca-certificates lsb-release gnupg build-essential
+  ok "Common packages installed"
+  systemctl enable --now nginx redis-server || true
+}
+
+install_php(){
   info "Installing PHP 8.3 and extensions..."
-  apt install -y php8.3 php8.3-fpm php8.3-cli php8.3-common php8.3-mbstring php8.3-gd \
+  add_sury_php_repo
+  apt_quiet_install php8.3 php8.3-fpm php8.3-cli php8.3-common php8.3-mbstring php8.3-gd \
     php8.3-mysql php8.3-redis php8.3-xml php8.3-bcmath php8.3-curl php8.3-zip php8.3-intl composer
   systemctl enable --now php8.3-fpm
   ok "PHP 8.3 installed"
 }
 
 install_mariadb(){
-  info "Installing MariaDB server..."
-  apt install -y mariadb-server
+  info "Installing MariaDB..."
+  apt_quiet_install mariadb-server
   systemctl enable --now mariadb
-  # create DB and user
-  if [ -z "$DB_PASS" ]; then
-    DB_PASS="$(openssl rand -base64 16)"
-  fi
+  ok "MariaDB installed"
+  info "Creating panel database and user..."
+  DB_PASS_LOCAL="${DB_PASS:-$(openssl rand -base64 16)}"
   mysql -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`panel\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS 'ptero'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
+CREATE USER IF NOT EXISTS 'ptero'@'127.0.0.1' IDENTIFIED BY '${DB_PASS_LOCAL}';
 GRANT ALL PRIVILEGES ON \`panel\`.* TO 'ptero'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL
-  echo "$DB_PASS" > /root/.ptero_db_pass
+  echo "$DB_PASS_LOCAL" > /root/.ptero_db_pass
   chmod 600 /root/.ptero_db_pass
-  ok "MariaDB installed and DB/user created (user: ptero)"
+  ok "Database 'panel' and user 'ptero' created (password saved to /root/.ptero_db_pass)"
 }
 
 download_panel(){
-  info "Downloading Pterodactyl Panel (latest release)..."
-  rm -rf "$PANEL_DIR"
-  mkdir -p "$PANEL_DIR"
-  cd "$PANEL_DIR"
+  info "Downloading Pterodactyl Panel (latest)..."
+  rm -rf "${PANEL_DIR}"
+  mkdir -p "${PANEL_DIR}"
+  cd "${PANEL_DIR}"
   curl -sL -o panel.tar.gz "https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz"
   tar -xzf panel.tar.gz
   rm -f panel.tar.gz
-  ok "Panel files placed at $PANEL_DIR"
+  ok "Panel downloaded to ${PANEL_DIR}"
 }
 
-install_composer_deps(){
-  info "Installing Composer dependencies (may take time)..."
+composer_install(){
+  info "Installing Composer dependencies (may take many minutes)..."
   if ! command -v composer >/dev/null 2>&1; then
     curl -sS https://getcomposer.org/installer | php
     mv composer.phar /usr/local/bin/composer
   fi
   composer install --no-dev --optimize-autoloader --no-interaction --no-ansi
-  ok "Composer packages installed"
+  ok "Composer dependencies installed"
 }
 
-prepare_env_and_migrate(){
-  info "Preparing .env and Laravel key"
+env_setup_and_migrate(){
+  info "Preparing .env and running migrations..."
   cp .env.example .env
   php artisan key:generate --force
-  # write DB + URL + Redis settings
   sed -i "s|APP_URL=.*|APP_URL=https://${DOMAIN}|" .env
   sed -i "s|DB_HOST=.*|DB_HOST=127.0.0.1|" .env
   sed -i "s|DB_PORT=.*|DB_PORT=3306|" .env
   sed -i "s|DB_DATABASE=.*|DB_DATABASE=panel|" .env
   sed -i "s|DB_USERNAME=.*|DB_USERNAME=ptero|" .env
-  DB_PASS_FILE="/root/.ptero_db_pass"
-  if [ -f "$DB_PASS_FILE" ]; then
-    sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=$(cat $DB_PASS_FILE)|" .env
+  if [ -f /root/.ptero_db_pass ]; then
+    sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=$(cat /root/.ptero_db_pass)|" .env
   else
     sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env
   fi
@@ -249,22 +255,21 @@ prepare_env_and_migrate(){
   sed -i "s|QUEUE_CONNECTION=.*|QUEUE_CONNECTION=redis|" .env || true
   sed -i "s|REDIS_HOST=.*|REDIS_HOST=127.0.0.1|" .env || true
 
-  info "Running migrations & seeders (may take a few minutes)..."
   php artisan migrate --seed --force
-  ok "Migrations & seeders completed"
+  ok "Migrations and seeders completed"
 }
 
 set_permissions(){
-  info "Setting permissions for panel files..."
-  chown -R www-data:www-data "$PANEL_DIR"
-  find "$PANEL_DIR" -type d -exec chmod 755 {} \;
-  find "$PANEL_DIR" -type f -exec chmod 644 {} \;
+  info "Setting ownership & permissions"
+  chown -R www-data:www-data "${PANEL_DIR}"
+  find "${PANEL_DIR}" -type d -exec chmod 755 {} \;
+  find "${PANEL_DIR}" -type f -exec chmod 644 {} \;
   ok "Permissions set"
 }
 
-nginx_site_create(){
-  info "Creating Nginx site for ${DOMAIN}..."
-  cat > /etc/nginx/sites-available/pterodactyl.conf <<NG
+nginx_config(){
+  info "Creating nginx site for ${DOMAIN}"
+  cat >/etc/nginx/sites-available/pterodactyl.conf <<NG
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -315,39 +320,38 @@ NG
   rm -f /etc/nginx/sites-enabled/default || true
   nginx -t
   systemctl reload nginx
-  ok "Nginx site created and reloaded"
+  ok "Nginx site enabled"
 }
 
-install_certbot_snap(){
-  info "Installing snapd & certbot (snap)"
-  apt install -y snapd
+install_snap_certbot(){
+  info "Installing snapd and certbot (snap)"
+  apt_quiet_install snapd
   snap install core || true
   snap refresh core || true
   snap install --classic certbot || true
   ln -sf /snap/bin/certbot /usr/bin/certbot
-  ok "Certbot installed via snap"
+  ok "Certbot (snap) ready"
 }
 
-request_letsencrypt(){
-  info "Requesting certificate from Let's Encrypt (using certbot)"
+get_lets_encrypt(){
+  info "Requesting Let's Encrypt certificate for ${DOMAIN} (non-interactive)"
+  # try nginx plugin first (will edit nginx conf)
   if certbot --nginx -d "${DOMAIN}" -m "${ADMIN_EMAIL}" --agree-tos --no-eff-email --non-interactive --redirect; then
-    ok "Let's Encrypt certificate obtained & nginx configured!"
+    ok "Let's Encrypt cert installed (nginx plugin)"
     return 0
-  else
-    warn "Certbot nginx plugin failed — trying webroot method"
-    if certbot certonly --webroot -w "${PANEL_DIR}/public" -d "${DOMAIN}" -m "${ADMIN_EMAIL}" --agree-tos --no-eff-email --non-interactive; then
-      nginx -t && systemctl reload nginx
-      ok "Certificate obtained via webroot and nginx reloaded"
-      return 0
-    else
-      warn "Let's Encrypt failed (rate limit or other). Will fallback to self-signed certificate"
-      return 1
-    fi
   fi
+  warn "Certbot nginx plugin failed; trying webroot method..."
+  if certbot certonly --webroot -w "${PANEL_DIR}/public" -d "${DOMAIN}" -m "${ADMIN_EMAIL}" --agree-tos --no-eff-email --non-interactive; then
+    nginx -t && systemctl reload nginx
+    ok "Let's Encrypt cert obtained via webroot"
+    return 0
+  fi
+  warn "Let's Encrypt request failed (rate-limit or other)."
+  return 1
 }
 
-install_self_signed(){
-  info "Creating self-signed certificate (fallback)"
+self_signed_cert(){
+  info "Creating self-signed cert as fallback (valid 1 year)"
   mkdir -p /etc/ssl
   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout /etc/ssl/panel.key -out /etc/ssl/panel.crt \
@@ -355,12 +359,12 @@ install_self_signed(){
   sed -i "s|ssl_certificate .*|ssl_certificate /etc/ssl/panel.crt;|g" /etc/nginx/sites-available/pterodactyl.conf || true
   sed -i "s|ssl_certificate_key .*|ssl_certificate_key /etc/ssl/panel.key;|g" /etc/nginx/sites-available/pterodactyl.conf || true
   nginx -t && systemctl reload nginx
-  warn "Self-signed certificate in use (browser will show a warning)"
+  warn "Self-signed certificate created (browser will show warning)"
 }
 
-create_queue_service(){
-  info "Creating systemd unit for queue worker (pteroq.service)"
-  cat > /etc/systemd/system/pteroq.service <<SVC
+create_queue_worker(){
+  info "Creating pteroq systemd service"
+  cat >/etc/systemd/system/pteroq.service <<SVC
 [Unit]
 Description=Pterodactyl Queue Worker
 After=network.target redis-server.service
@@ -376,11 +380,11 @@ WantedBy=multi-user.target
 SVC
   systemctl daemon-reload
   systemctl enable --now pteroq.service
-  ok "Queue worker service enabled"
+  ok "Queue worker enabled"
 }
 
 install_wings(){
-  info "Installing Docker & Wings (node)"
+  info "Installing Docker and Wings (node)"
   curl -fsSL https://get.docker.com | bash
   systemctl enable --now docker
   WINGS_BIN_URL=$(curl -s https://api.github.com/repos/pterodactyl/wings/releases/latest | grep "browser_download_url" | grep linux | head -n1 | cut -d '"' -f4)
@@ -404,11 +408,11 @@ WantedBy=multi-user.target
 W
   systemctl daemon-reload
   systemctl enable --now wings
-  ok "Wings installed and running (service: wings)"
+  ok "Wings installed and running"
 }
 
 apply_theme_zaleedark(){
-  info "Applying ZaleeDark theme from: ${THEME_REPO}"
+  info "Applying ZaleeDark theme from ${THEME_REPO}"
   mkdir -p "${PANEL_DIR}/public/themes"
   if git ls-remote "${THEME_REPO}" &>/dev/null; then
     rm -rf /tmp/zaleedark || true
@@ -416,101 +420,92 @@ apply_theme_zaleedark(){
     cp -r /tmp/zaleedark/* "${PANEL_DIR}/public/themes/" || true
     chown -R www-data:www-data "${PANEL_DIR}/public/themes"
     rm -rf /tmp/zaleedark
-    ok "ZaleeDark theme applied to panel"
+    ok "ZaleeDark theme applied"
   else
-    warn "Could not access theme repo; please check THEME_REPO URL"
+    warn "Theme repo not accessible; skipping theme application"
   fi
 }
 
-# ---------- Execution sequences based on CHOICE ----------
-# We will perform tasks step-by-step with checks
-if [ "$CHOICE" = "0" ]; then
-  echo "Exit selected. Bye."
-  exit 0
-fi
-
-# always install basics first when doing panel/wings/full or theme apply needs files
-if [[ "$CHOICE" =~ ^(1|3|4)$ ]]; then
-  install_basic_packages
-  add_sury_php
-fi
-
-# Install DB if requested and Panel related selected
-if [[ "$CHOICE" =~ ^(1|4)$ ]] && [ "$DB_INSTALL" = "yes" ]; then
-  install_mariadb
-fi
-
-# PANEL installation
+# ----------------- Execution flows -----------------
+# Panel
 if [[ "$CHOICE" =~ ^(1|4)$ ]]; then
+  install_common_packages
+  install_php
+  if [ "$DB_WANT" = "yes" ]; then
+    install_mariadb
+  fi
   download_panel
-  install_composer_deps
-  prepare_env_and_migrate
+  composer_install
+  env_setup_and_migrate
   set_permissions
-  nginx_site_create
-  create_queue_service
-  # SSL handling
-  if [ "$SSL_CHOICE" = "letsencrypt" ]; then
-    install_certbot_snap
-    if ! request_letsencrypt; then
-      install_self_signed
+  nginx_config
+  create_queue_worker
+
+  if [[ "${SSL_METHOD}" == "letsencrypt" ]]; then
+    install_snap_certbot
+    if ! get_lets_encrypt; then
+      self_signed_cert
     fi
   else
-    install_self_signed
+    self_signed_cert
   fi
-  # apply theme if chosen in full/install flow or via option 3 later
-  if [ "$CHOICE" = "4" ] || confirm_prompt "Apply ZaleeDark theme now?" 1; then
+
+  if [ "$CHOICE" = "4" ] || confirm "Apply ZaleeDark theme now?" 1; then
     apply_theme_zaleedark
   fi
-  ok "Panel installation finished"
+
+  if [ "$CREATE_ADMIN" -eq 1 ]; then
+    info "Attempting to create admin user via artisan (best-effort)"
+    if php "${PANEL_DIR}/artisan" p:user:make --email="${ADMIN_EMAIL}" --username="${ADMIN_USER}" --name-first="Zalee" --name-last="Host" --password="${ADMIN_PASS}" --admin=1 --no-interaction >/dev/null 2>&1; then
+      ok "Admin created: ${ADMIN_EMAIL} / ${ADMIN_PASS}"
+    else
+      warn "Automatic admin creation not supported on this panel version — create manually:"
+      echo "  php ${PANEL_DIR}/artisan p:user:make"
+    fi
+  fi
 fi
 
-# WINGS installation
+# Wings
 if [[ "$CHOICE" =~ ^(2|4)$ ]]; then
+  install_common_packages
   install_wings
 fi
 
-# If user selected only theme (3) and not panel, still attempt to fetch theme into panel dir
-if [ "$CHOICE" = "3" ] && [ ! -d "$PANEL_DIR" ]; then
-  warn "Panel directory $PANEL_DIR not present — theme will be downloaded but may not apply until panel is installed."
-  mkdir -p "$PANEL_DIR/public/themes"
+# Theme only (and panel not installed)
+if [[ "$CHOICE" = "3" ]] && [ ! -d "${PANEL_DIR}" ]; then
+  warn "Panel directory ${PANEL_DIR} does not exist. Theme will be saved but may not apply until panel is installed."
+  mkdir -p "${PANEL_DIR}/public/themes"
 fi
-if [ "$CHOICE" = "3" ]; then
+if [[ "$CHOICE" = "3" ]]; then
   apply_theme_zaleedark
 fi
 
-# Final admin creation (if requested)
-if [ "$CREATE_ADMIN" -eq 1 ] && [[ "$CHOICE" =~ ^(1|4)$ ]]; then
-  info "Attempting to create admin user via artisan (best-effort)"
-  if php "${PANEL_DIR}/artisan" p:user:make --email="${ADMIN_EMAIL}" --username="${ADMIN_USER}" --name-first="Zalee" --name-last="Host" --password="${ADMIN_PASS}" --admin=1 --no-interaction >/dev/null 2>&1; then
-    ok "Admin created: ${ADMIN_EMAIL} / ${ADMIN_PASS}"
-  else
-    warn "Automatic admin creation not supported by this panel build — create manually with:"
-    echo "php ${PANEL_DIR}/artisan p:user:make"
-  fi
-fi
-
 # UFW
-info "Applying UFW rules (22,80,443)"
+info "Applying firewall rules (22/80/443)"
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable || true
-ok "Firewall configured"
+ok "Firewall ready"
 
-# Summary
+# Final Summary
 echo
-echo -e "${BOLD}${GREEN}========================================${RESET}"
-echo -e "${BOLD}${GREEN}  Installation finished (check above for ✔ messages)${RESET}"
-echo -e "  Panel URL  : https://${DOMAIN}"
+printf "${BOLD}${GREEN}========================================${RESET}\n"
+printf "${BOLD}${GREEN}  Installation completed (check messages above)${RESET}\n"
+printf "  Panel URL  : https://%s\n" "$DOMAIN"
 if [ -f /root/.ptero_db_pass ]; then
-  echo -e "  DB user    : ptero"
-  echo -e "  DB pass    : $(cat /root/.ptero_db_pass)"
+  printf "  DB user    : ptero\n"
+  printf "  DB pass    : %s\n" "$(cat /root/.ptero_db_pass)"
 fi
 if [ "$CREATE_ADMIN" -eq 1 ]; then
-  echo -e "  Admin user : ${ADMIN_EMAIL} / ${ADMIN_PASS}"
+  printf "  Admin      : %s / %s\n" "$ADMIN_EMAIL" "$ADMIN_PASS"
 else
-  echo -e "  Admin user : please create manually: php ${PANEL_DIR}/artisan p:user:make"
+  printf "  Admin      : run: php %s/artisan p:user:make\n" "$PANEL_DIR"
 fi
-echo -e "  Panel dir  : ${PANEL_DIR}"
-echo -e "  Logs       : $LOGFILE"
-echo -e "${BOLD}${GREEN}========================================${RESET}"
+printf "  Panel dir  : %s\n" "$PANEL_DIR"
+printf "  Log file   : %s\n" "$LOGFILE"
+printf "${BOLD}${GREEN}========================================${RESET}\n"
+
+ok "If you want, push this file to GitHub as 'pterodactyl.sh' in your repo and run it on the VPS."
+
+# End of script
